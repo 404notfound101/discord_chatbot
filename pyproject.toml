@@ -1,0 +1,28 @@
+[project]
+name = "discord-bot"
+
+[tool.poetry]
+name = "discord-bot"
+version = "0.0.1"
+description = ""
+authors = []
+readme = "README.md"
+license = "MIT"
+packages = [
+    { include = "discord_bot" }
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11, <3.12"
+openai = "^1.57.4"
+qdrant-client = "^1.12.1"
+langchain = "^0.3.11"
+langchain-core = "^0.3.24"
+langchain-openai = "^0.2.12"
+langgraph = "^0.2.59"
+boto3 = "^1.35.81"
+"discord.py" = "2.4.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

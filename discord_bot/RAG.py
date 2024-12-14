@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List
 from typing_extensions import TypedDict
 import os
 import logging
@@ -8,9 +8,11 @@ from qdrant_client.models import PointStruct
 from langchain import hub
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import PromptTemplate
 import boto3
 from langgraph.graph import END, StateGraph, START
+from langgraph.graph.state import CompiledStateGraph
+from functools import partial
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
@@ -18,20 +20,20 @@ llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
 prompt = hub.pull("rlm/rag-prompt")
 rag_chain = prompt | llm | StrOutputParser()
 
-find_user_query = """You are trying to find any user name information from the User question if it's possible. Your answer 
-should be a single word with only common characters. There should be any space or quotation mark in your answer, e.g. 
-john_smith. If you can't find any user name information, please answer with no_user_name."""
+find_user_query = """You are attempting to extract a username from the user’s question, if any. Your answer should
+be a single word containing only common characters (e.g. crazy_TAFAWF or Dove Smith as dove_smith) and must not
+include spaces, quotation marks, or additional formatting. \n\nUser question: {question}"""
 
-search_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", find_user_query),
-        ("human", "User question: \n\n {question}"),
-    ]
+search_prompt = PromptTemplate(
+    template=find_user_query,
+    input_variables=["question"],
 )
-search_chain = search_prompt | rag_chain | StrOutputParser()
+search_chain = search_prompt | llm | StrOutputParser()
 
 
-def add_docs(texts: List[str]):
+def add_docs(
+    texts: List[str], openai_client: openai.Client, q_client: qdrant_client.QdrantClient
+):
     """
     Add documents to the vector database
 
@@ -39,9 +41,6 @@ def add_docs(texts: List[str]):
         txt (str): The text to be added to the vector database
 
     """
-    openai_client = openai.Client(
-        api_key=os.getenv("OPENAI_API_KEY")
-    )
     result = openai_client.embeddings.create(input=texts, model=EMBEDDING_MODEL)
 
     points = [
@@ -52,12 +51,7 @@ def add_docs(texts: List[str]):
         )
         for idx, (data, text) in enumerate(zip(result.data, texts))
     ]
-    qdrant_client = qdrant_client.QdrantClient(
-        url=os.getenv("QDRANT_URL"), 
-        api_key=os.getenv("QDRANT_API_KEY"),
-    )
-    qdrant_client.upsert("discord", points)
-
+    q_client.upsert("discord", points)
 
 
 class GraphState(TypedDict):
@@ -66,19 +60,16 @@ class GraphState(TypedDict):
 
     Attributes:
         question: question
-        memory: memory in form of {question: answer}
         generation: LLM generation
-        web_search: whether to add search
         documents: list of documents
     """
 
     question: str
-    memory: List[str, str]
     generation: str
-    web_search: str
     documents: List[str]
 
-def retrieve(state):
+
+def retrieve(state, openai_client: openai.Client, q_client: qdrant_client.QdrantClient):
     """
     Retrieve documents
 
@@ -89,27 +80,23 @@ def retrieve(state):
         state (dict): New key added to state, documents, that contains retrieved documents
     """
     logging.info("---Retrieving documents---")
-    openai_client = openai.Client(
-        api_key=os.getenv("OPENAI_API_KEY")
-    )
-    qdrant_client = qdrant_client.QdrantClient(
-        url=os.getenv("QDRANT_URL"), 
-        api_key=os.getenv("QDRANT_API_KEY"),
-    )
-    results = qdrant_client.search(
+    results = q_client.search(
         collection_name="discord",
         query_vector=openai_client.embeddings.create(
             input=[state["question"]],
             model=EMBEDDING_MODEL,
-        ).data[0].embedding,
-        limit=2
+        )
+        .data[0]
+        .embedding,
+        limit=3,
     )
     docs = [result.payload["text"] for result in results if result.score > 0.7]
     # TODO: some other reranking
     docs += state["documents"]
     return {"documents": docs, "question": state["question"]}
 
-def search_db(state):
+
+def search_db(state, db: boto3.client):
     """
     Search the database for documents
 
@@ -122,25 +109,27 @@ def search_db(state):
     logging.info("---Searching database---")
     user = search_chain.invoke({"question": state["question"]})
     try:
-        db = boto3.client("dynamodb")
         response = db.get_item(
             TableName=os.getenv("DYNAMODB_TABLE"),
             Key={
                 "user": {"S": user},
-            }
+            },
         )
     except Exception as e:
         logging.error(f"Error: {e}")
         return {"documents": [], "question": state["question"]}
     docs = []
     if "Item" in response:
-        data = f"Information from database for user state['user']: "
+        data = "Information from database for user state['user']: "
         for key, typed_value in response["Item"].items():
-            values = [v for k, v in typed_value.items()]
+            values = [
+                v for _, v in typed_value.items()
+            ]  # the format of value is {'S': 'value'}
             data += f"{key}: {values} | "
         docs.append(data)
 
     return {"documents": docs, "question": state["question"]}
+
 
 def generate(state):
     """
@@ -160,15 +149,27 @@ def generate(state):
     generation = rag_chain.invoke({"context": documents, "question": question})
     return {"documents": documents, "question": question, "generation": generation}
 
-workflow = StateGraph(GraphState)
 
-workflow.add_node("database_search", search_db)
-workflow.add_node("retrieve", retrieve)
-workflow.add_node("generate", generate)
+def generate_graph(
+    openai_client: openai.Client, q_client: qdrant_client.QdrantClient, db: boto3.client
+) -> CompiledStateGraph:
+    """
+    Generate the RAG graph
 
-workflow.add_edge(START, "database_search")
-workflow.add_edge("database_search", "retrieve")
-workflow.add_edge("retrieve", "generate")
-workflow.add_edge("generate", END)
+    Returns:
+        CompiledStateGraph: The compiled RAG graph
+    """
+    workflow = StateGraph(GraphState)
 
-app = workflow.compile()
+    workflow.add_node("database_search", partial(search_db, db=db))
+    workflow.add_node(
+        "retrieve", partial(retrieve, openai_client=openai_client, q_client=q_client)
+    )
+    workflow.add_node("generate", generate)
+
+    workflow.add_edge(START, "database_search")
+    workflow.add_edge("database_search", "retrieve")
+    workflow.add_edge("retrieve", "generate")
+    workflow.add_edge("generate", END)
+
+    return workflow.compile()
